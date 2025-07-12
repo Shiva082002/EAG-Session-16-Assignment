@@ -146,21 +146,20 @@ class AgentLoop4:
                     visualizer.mark_failed(step_id, result["error"])
                     context.mark_failed(step_id, result["error"])
 
-        # Final state
-        console.print(visualizer.get_layout())
+        # Final state        console.print(visualizer.get_layout())
         
         if context.all_done():
             console.print("🎉 All tasks completed!")
 
     async def _execute_step(self, step_id, context):
-        """Execute a single step with call_self support"""
+        """Execute a single step with call_self support (up to 4 iterations)"""
         step_data = context.get_step_data(step_id)
         agent_type = step_data["agent"]
         
         # Get inputs from NetworkX graph
         inputs = context.get_inputs(step_data.get("reads", []))
         
-        # 🔧 HELPER FUNCTION: Build agent input (consistent for both iterations)
+        # 🔧 HELPER FUNCTION: Build agent input (consistent for all iterations)
         def build_agent_input(instruction=None, previous_output=None, iteration_context=None):
             if agent_type == "FormatterAgent":
                 all_globals = context.plan_graph.graph['globals_schema'].copy()
@@ -191,54 +190,71 @@ class AgentLoop4:
                     **({"iteration_context": iteration_context} if iteration_context else {})
                 }
 
+        # Initialize call_self tracking
+        max_call_self_iterations = 4  # 🎯 UPDATED: Increased from 2 to 4
+        iterations_data = []
+        current_iteration = 1
+        previous_output = None
+        
         # Execute first iteration
+        log_step(f"🔄 {agent_type} Step {step_id} - Iteration {current_iteration}")
         agent_input = build_agent_input()
         result = await self.agent_runner.run_agent(agent_type, agent_input)
         
-        if result["success"]:
-            output = result["output"]
-            
-            # Check for call_self
-            if output.get("call_self"):
-                # Handle code execution if needed
-                if context._has_executable_code(output):
-                    execution_result = await context._auto_execute_code(step_id, output)
-                    if execution_result.get("status") == "success":
-                        execution_data = execution_result.get("result", {})
-                        inputs = {**inputs, **execution_data}  # Update inputs for iteration 2
-                
-                # Execute second iteration with consistent input structure
-                second_agent_input = build_agent_input(
-                    instruction=output.get("next_instruction", "Continue the task"),
-                    previous_output=output,
-                    iteration_context=output.get("iteration_context", {})
-                )
-                
-                second_result = await self.agent_runner.run_agent(agent_type, second_agent_input)
-                
-                # 💾 CRITICAL: Store iteration data in session
-                iterations_data = [
-                    {"iteration": 1, "output": output}
-                ]
-                
-                if second_result["success"]:
-                    iterations_data.append({"iteration": 2, "output": second_result["output"]})
-                    final_result = second_result
-                else:
-                    iterations_data.append(None)
-                    final_result = result
-                
-                # Store iterations in the node data for session persistence
-                step_data = context.get_step_data(step_id)
-                step_data['iterations'] = iterations_data
-                step_data['call_self_used'] = True
-                step_data['final_iteration_output'] = final_result["output"]
-                
-                return final_result
-            else:
-                return result
-        else:
+        if not result["success"]:
             return result
+            
+        output = result["output"]
+        iterations_data.append({"iteration": current_iteration, "output": output})
+        previous_output = output
+        
+        # Handle call_self iterations (up to 4 total)
+        while output.get("call_self") and current_iteration < max_call_self_iterations:
+            current_iteration += 1
+            log_step(f"🔄 {agent_type} Step {step_id} - Self-call Iteration {current_iteration}")
+            
+            # Handle code execution if needed before next iteration
+            if context._has_executable_code(output):
+                execution_result = await context._auto_execute_code(step_id, output)
+                if execution_result.get("status") == "success":
+                    execution_data = execution_result.get("result", {})
+                    inputs = {**inputs, **execution_data}  # Update inputs for next iteration
+            
+            # Execute next iteration with consistent input structure
+            next_agent_input = build_agent_input(
+                instruction=output.get("next_instruction", f"Continue the task - Iteration {current_iteration}"),
+                previous_output=previous_output,
+                iteration_context=output.get("iteration_context", {})
+            )
+            
+            next_result = await self.agent_runner.run_agent(agent_type, next_agent_input)
+            
+            if next_result["success"]:
+                output = next_result["output"]
+                iterations_data.append({"iteration": current_iteration, "output": output})
+                previous_output = output
+                result = next_result  # Update final result
+            else:
+                # If iteration fails, log and stop
+                iterations_data.append({"iteration": current_iteration, "output": None, "error": next_result.get("error")})
+                log_error(f"❌ {agent_type} Step {step_id} - Iteration {current_iteration} failed: {next_result.get('error')}")
+                break
+        
+        # Log completion
+        if current_iteration > 1:
+            if output.get("call_self") and current_iteration >= max_call_self_iterations:
+                log_step(f"⚠️ {agent_type} Step {step_id} - Reached maximum call_self iterations ({max_call_self_iterations})")
+            else:
+                log_step(f"✅ {agent_type} Step {step_id} - Completed after {current_iteration} iterations")
+        
+        # 💾 CRITICAL: Store iteration data in session
+        step_data = context.get_step_data(step_id)
+        step_data['iterations'] = iterations_data
+        step_data['call_self_used'] = current_iteration > 1
+        step_data['total_iterations'] = current_iteration
+        step_data['final_iteration_output'] = result["output"]
+        
+        return result
 
     async def _handle_failures(self, context):
         """Handle failures via mid-session replanning"""

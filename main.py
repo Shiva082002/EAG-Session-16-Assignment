@@ -116,4 +116,6 @@ async def main():
     await multi_mcp.shutdown()
 
 if __name__ == "__main__":
+    import sys
+
     asyncio.run(main())
